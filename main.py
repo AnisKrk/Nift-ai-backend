@@ -5,11 +5,22 @@ app = FastAPI()
 
 @app.get("/")
 def home():
-    data = yf.download("^NSEI", period="1d", interval="5m")
-    close = float(data["Close"].iloc[-1])
+    try:
+        data = yf.download("^NSEI", period="1d", interval="5m")
 
-    return {
-        "price": close,
-        "signal": "BUY" if close > float(data["Close"].iloc[-2]) else "SELL",
-        "confidence": 0.6
-    }
+        if data.empty:
+            return {"error": "No market data available"}
+
+        close = float(data["Close"].iloc[-1])
+        prev = float(data["Close"].iloc[-2])
+
+        signal = "BUY" if close > prev else "SELL"
+
+        return {
+            "price": close,
+            "signal": signal,
+            "confidence": 0.6
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
