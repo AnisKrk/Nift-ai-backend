@@ -3,19 +3,8 @@ import yfinance as yf
 from fastapi.responses import HTMLResponse
 import pandas as pd
 from datetime import datetime
-import requests
 
 app = FastAPI()
-
-# ────────────────────────────────────────────────
-# HELPER: Session with User-Agent to avoid blocks
-# ────────────────────────────────────────────────
-def get_yf_session():
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    })
-    return session
 
 # ────────────────────────────────────────────────
 # Prediction Endpoint
@@ -23,39 +12,25 @@ def get_yf_session():
 @app.get("/")
 def predict():
     try:
-        # FIX: Use the custom session here
-        session = get_yf_session()
-        data = yf.download("^NSEI", period="1d", interval="5m", progress=False, session=session)
+        # NOTE: We removed the custom session here. 
+        # yfinance will now automatically use 'curl_cffi' (if installed) to bypass blocks.
+        data = yf.download("^NSEI", period="1d", interval="5m", progress=False)
 
-        # Handle empty data or data that returns but is empty inside
+        # Fallback: Try fetching 5 days if 1 day fails or is empty
         if data.empty or len(data) < 5:
-            # Fallback: Try fetching 5 days of data if 1 day fails (sometimes 1d fails early morning)
-            data = yf.download("^NSEI", period="5d", interval="5m", progress=False, session=session)
+            data = yf.download("^NSEI", period="5d", interval="5m", progress=False)
         
         last_time = data.index[-1] if not data.empty else datetime.utcnow()
-        now_utc = datetime.utcnow()
         
-        # NSE hours in UTC: 03:45 to 10:00 (approx 9:15 AM - 3:30 PM IST)
-        # We add a buffer so you can test it even if slightly outside hours
-        market_open_utc = now_utc.replace(hour=3, minute=40, second=0, microsecond=0) 
-        market_close_utc = now_utc.replace(hour=10, minute=15, second=0, microsecond=0)
-
-        # Allow off-hours debugging (Comment out the next 3 lines if you want strict hours)
-        # if now_utc < market_open_utc or now_utc > market_close_utc:
-        #    return {"signal": "CLOSED", "message": "Market is closed (NSE: 9:15 AM – 3:30 PM IST)"}
-
-        if data.empty or len(data) < 30:
+        # Check if data is still empty after fallback
+        if data.empty or len(data) < 5:
             return {
                 "signal": "DATA ERROR",
-                "message": "Yahoo Finance returned no data. They might be rate-limiting cloud IPs."
+                "message": "Yahoo Finance is blocking data. Ensure 'curl-cffi' is in requirements.txt"
             }
 
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
-
-        # 25 min wait rule
-        market_open_today = last_time.replace(hour=3, minute=45) # 9:15 IST
-        # (Skipping this check for now to ensure you see data first)
         
         close = data["Close"]
         high = data["High"]
@@ -110,10 +85,8 @@ def predict():
                 elif direction.iloc[i] == -1 and supertrend.iloc[i] > upper_band.iloc[i]:
                     supertrend.iloc[i] = upper_band.iloc[i]
             
-            # Fill NaN if any (rare)
             if pd.isna(supertrend.iloc[i]):
                  supertrend.iloc[i] = supertrend.iloc[i-1]
-
 
         st_last = float(supertrend.iloc[-1])
         st_dir = direction.iloc[-1]
@@ -180,7 +153,6 @@ def predict():
 @app.get("/reasoning")
 def get_reasoning():
     pred = predict()
-    # Simple pass-through of error messages
     if "signal" in pred and pred["signal"] in ["ERROR", "DATA ERROR", "CLOSED"]:
          return {"reasoning": pred["message"]}
 
@@ -219,14 +191,12 @@ def chart(interval: str = Query("5m")):
         if interval not in valid_intervals:
             interval = "5m"
 
-        session = get_yf_session()
-        # Fallback to 5d if 1d fails, just to ensure chart always has data
-        data = yf.download("^NSEI", period="5d", interval=interval, progress=False, session=session)
+        # No custom session here either!
+        data = yf.download("^NSEI", period="5d", interval=interval, progress=False)
         
         if data.empty:
             return {"error": "No chart data available from Yahoo"}
 
-        # Only take the last 200 candles to keep payload small
         data = data.tail(200)
 
         if isinstance(data.columns, pd.MultiIndex):
@@ -239,7 +209,7 @@ def chart(interval: str = Query("5m")):
         ema_fast = close.ewm(span=9, adjust=False).mean()
         ema_slow = close.ewm(span=21, adjust=False).mean()
 
-        # Supertrend Calculation
+        # Supertrend
         tr1 = high - low
         tr2 = abs(high - close.shift())
         tr3 = abs(low - close.shift())
@@ -269,7 +239,6 @@ def chart(interval: str = Query("5m")):
                 elif direction.iloc[i] == -1 and supertrend.iloc[i] > upper_band.iloc[i]:
                     supertrend.iloc[i] = upper_band.iloc[i]
             
-            # Fix potential NaN
             if pd.isna(supertrend.iloc[i]):
                  supertrend.iloc[i] = supertrend.iloc[i-1]
 
@@ -384,7 +353,6 @@ async function loadData() {
 
         document.getElementById("price").innerText = `Current Price: ${pred.price || '—'}`;
         
-        // FIXED SYNTAX HERE:
         document.getElementById("indicators").innerText = 
             `EMA 9/21: ${pred.ema_fast || '-'} / ${pred.ema_slow || '-'} | RSI: ${pred.rsi || '-'} | Supertrend: ${pred.supertrend || '-'} (${pred.st_dir || '-'})`;
 
@@ -398,7 +366,6 @@ async function loadData() {
         const reasonData = await reasonRes.json();
         document.getElementById("reasoning-text").innerText = reasonData.reasoning || "No reasoning available";
 
-        // Load Chart
         const chartRes = await fetch(`/chart?interval=${interval}`);
         const chartData = await chartRes.json();
         
