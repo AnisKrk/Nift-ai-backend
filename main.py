@@ -1,8 +1,12 @@
 from fastapi import FastAPI
 import yfinance as yf
+from fastapi.responses import HTMLResponse
 
 app = FastAPI()
 
+# -----------------------------
+# Prediction Endpoint (EMA)
+# -----------------------------
 @app.get("/")
 def predict():
     try:
@@ -39,6 +43,9 @@ def predict():
     except Exception as e:
         return {"error": str(e)}
 
+# -----------------------------
+# Candle Data Endpoint
+# -----------------------------
 @app.get("/chart")
 def chart():
     try:
@@ -67,37 +74,43 @@ def chart():
     except Exception as e:
         return {"error": str(e)}
 
-from fastapi.responses import HTMLResponse
-
+# -----------------------------
+# Dashboard UI
+# -----------------------------
 @app.get("/app", response_class=HTMLResponse)
 def app_ui():
     return """
-    <html>
+<html>
 <head>
 <title>NIFTY AI Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 
 <body style="background:black;color:white;text-align:center;font-family:sans-serif">
-
 <h2>NIFTY Intraday AI</h2>
 
 <h1 id="signal">Loading...</h1>
 <p id="price"></p>
 <p id="confidence"></p>
 
-<canvas id="chart"></canvas>
+<canvas id="chart" style="width:100%;max-width:600px;"></canvas>
 
 <script>
 async function loadData() {
 
+  // Fetch prediction
   const predRes = await fetch("/");
   const pred = await predRes.json();
 
-  document.getElementById("signal").innerText = pred.signal;
+  // Update signal + color
+  const signalEl = document.getElementById("signal");
+  signalEl.innerText = pred.signal;
+  signalEl.style.color = pred.signal === "BUY" ? "green" : "red";
+
   document.getElementById("price").innerText = "Price: " + pred.price;
   document.getElementById("confidence").innerText = "Confidence: " + pred.confidence;
 
+  // Fetch chart data
   const res = await fetch("/chart");
   const data = await res.json();
 
@@ -105,21 +118,33 @@ async function loadData() {
   const prices = data.candles.map(c => c.close);
 
   new Chart(document.getElementById("chart"), {
-    type: "line",
-    data: {
-      labels: labels,
-      datasets: [{
-        label: "NIFTY",
-        data: prices
-      }]
-    }
+      type: "line",
+      data: {
+          labels: labels,
+          datasets: [{
+              label: "NIFTY",
+              data: prices,
+              borderColor: 'white',
+              borderWidth: 2,
+              fill: false
+          }]
+      },
+      options: {
+          responsive: true,
+          plugins: { legend: { labels: { color: "white" } } },
+          scales: {
+              x: { ticks: { color: "white" } },
+              y: { ticks: { color: "white" } }
+          }
+      }
   });
 }
 
+// Initial load + auto-refresh every 60s
 loadData();
 setInterval(loadData, 60000);
-</script>
 
+</script>
 </body>
 </html>
-    """
+"""
