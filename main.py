@@ -5,12 +5,24 @@ import pandas as pd
 from datetime import datetime
 import asyncio
 import traceback
+import math
 
 app = FastAPI()
 
 # ────────────────────────────────────────────────
+# HELPER: CLEAN NAN VALUES
+# Converts NaN/Inf to None so JSON doesn't crash
+# ────────────────────────────────────────────────
+def clean_val(val):
+    if val is None:
+        return None
+    if isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            return None
+    return val
+
+# ────────────────────────────────────────────────
 # GLOBAL ERROR HANDLER
-# This catches "Internal Server Error" and prints the real reason
 # ────────────────────────────────────────────────
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -26,21 +38,14 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.get("/")
 async def predict():
     try:
-        # FIX: Run yfinance in a separate thread to prevent "curl_cffi" crashes
-        # This isolates the download process from the web server loop
         loop = asyncio.get_event_loop()
         data = await loop.run_in_executor(None, lambda: yf.download("^NSEI", period="1d", interval="5m", progress=False))
 
-        # Fallback if 1d is empty (common in early morning)
         if data.empty or len(data) < 5:
             data = await loop.run_in_executor(None, lambda: yf.download("^NSEI", period="5d", interval="5m", progress=False))
 
-        # Check if data is still empty
         if data.empty:
-            return {
-                "signal": "DATA ERROR", 
-                "message": "Yahoo returned no data. Try clearing Render cache and redeploying."
-            }
+            return {"signal": "DATA ERROR", "message": "Yahoo returned no data. Market might be closed or blocking."}
 
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
@@ -140,24 +145,24 @@ async def predict():
             target = price
             stop_loss = price
 
+        # RETURN WITH CLEANING
+        # We wrap every float in clean_val()
         return {
-            "price": round(price, 2),
+            "price": clean_val(round(price, 2)),
             "signal": signal,
-            "ema_fast": round(fast, 2),
-            "ema_slow": round(slow, 2),
-            "rsi": round(rsi_last, 1),
-            "atr": round(atr_last, 2),
-            "supertrend": round(st_last, 2),
+            "ema_fast": clean_val(round(fast, 2)),
+            "ema_slow": clean_val(round(slow, 2)),
+            "rsi": clean_val(round(rsi_last, 1)),
+            "atr": clean_val(round(atr_last, 2)),
+            "supertrend": clean_val(round(st_last, 2)),
             "st_dir": "BULLISH" if st_dir == 1 else "BEARISH" if st_dir == -1 else "N/A",
-            "confidence": confidence,
-            "target": round(target, 2),
-            "stop_loss": round(stop_loss, 2),
+            "confidence": clean_val(confidence),
+            "target": clean_val(round(target, 2)),
+            "stop_loss": clean_val(round(stop_loss, 2)),
             "time": str(last_time)
         }
 
     except Exception as e:
-        # This will now be caught by the global handler if it's a hard crash,
-        # but for logic errors, we return this:
         return {"signal": "ERROR", "message": f"Logic Error: {str(e)}"}
 
 # ────────────────────────────────────────────────
@@ -204,7 +209,6 @@ async def get_reasoning():
 async def chart(interval: str = "5m"):
     try:
         loop = asyncio.get_event_loop()
-        # Also run chart download in thread to prevent crashes
         data = await loop.run_in_executor(None, lambda: yf.download("^NSEI", period="5d", interval=interval, progress=False))
         
         if data.empty:
@@ -261,21 +265,26 @@ async def chart(interval: str = "5m"):
 
         for index, row in data.iterrows():
             time_unix = int(index.timestamp())
-            candles.append({
-                "time": time_unix,
-                "open": float(row["Open"]),
-                "high": float(row["High"]),
-                "low": float(row["Low"]),
-                "close": float(row["Close"])
-            })
             
-            ef_val = float(ema_fast.loc[index]) if pd.notna(ema_fast.loc[index]) else None
-            es_val = float(ema_slow.loc[index]) if pd.notna(ema_slow.loc[index]) else None
-            st_val = float(supertrend.loc[index]) if pd.notna(supertrend.loc[index]) else None
+            # Clean candle data
+            o = clean_val(float(row["Open"]))
+            h = clean_val(float(row["High"]))
+            l = clean_val(float(row["Low"]))
+            c = clean_val(float(row["Close"]))
+            
+            if None not in [o, h, l, c]:
+                candles.append({
+                    "time": time_unix, "open": o, "high": h, "low": l, "close": c
+                })
+            
+            # Clean indicator data
+            ef_val = clean_val(float(ema_fast.loc[index]))
+            es_val = clean_val(float(ema_slow.loc[index]))
+            st_val = clean_val(float(supertrend.loc[index]))
 
-            if ef_val: ema_fast_data.append({"time": time_unix, "value": ef_val})
-            if es_val: ema_slow_data.append({"time": time_unix, "value": es_val})
-            if st_val: supertrend_data.append({"time": time_unix, "value": st_val})
+            if ef_val is not None: ema_fast_data.append({"time": time_unix, "value": ef_val})
+            if es_val is not None: ema_slow_data.append({"time": time_unix, "value": es_val})
+            if st_val is not None: supertrend_data.append({"time": time_unix, "value": st_val})
 
         return {
             "candles": candles,
