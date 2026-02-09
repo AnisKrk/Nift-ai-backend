@@ -59,3 +59,44 @@ def chart():
 
     except Exception as e:
         return {"error": str(e)}
+
+from fastapi.responses import HTMLResponse
+
+@app.get("/app", response_class=HTMLResponse)
+def app_ui():
+    return """
+    <html>
+    <head>
+        <title>NIFTY AI Dashboard</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    </head>
+
+    <body style="background:black;color:white;text-align:center;font-family:sans-serif">
+        <h2>NIFTY Intraday AI</h2>
+        <canvas id="chart"></canvas>
+
+        <script>
+        async function loadChart(){
+            const res = await fetch("/chart");
+            const data = await res.json();
+
+            const labels = data.candles.map(c => c.time);
+            const prices = data.candles.map(c => c.close);
+
+            new Chart(document.getElementById("chart"), {
+                type: "line",
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: "NIFTY",
+                        data: prices
+                    }]
+                }
+            });
+        }
+
+        loadChart();
+        </script>
+    </body>
+    </html>
+    """
