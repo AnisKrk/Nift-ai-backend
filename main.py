@@ -4,29 +4,36 @@ import yfinance as yf
 app = FastAPI()
 
 @app.get("/")
-def home():
+def predict():
     try:
         data = yf.download("^NSEI", period="1d", interval="5m", progress=False)
 
         if data.empty:
-            return {"error": "No market data available"}
+            return {"error": "No market data"}
 
-        # Always extract scalar safely
-        close_series = data["Close"]
+        if hasattr(data.columns, "levels"):
+            data.columns = data.columns.get_level_values(0)
 
-        # If multi-column → take first column
-        if hasattr(close_series, "iloc") and len(close_series.shape) > 1:
-            close_series = close_series.iloc[:, 0]
+        close = data["Close"]
 
-        close = float(close_series.iloc[-1])
-        prev = float(close_series.iloc[-2])
+        ema_fast = close.ewm(span=9).mean()
+        ema_slow = close.ewm(span=21).mean()
 
-        signal = "BUY" if close > prev else "SELL"
+        price = float(close.iloc[-1])
+        fast = float(ema_fast.iloc[-1])
+        slow = float(ema_slow.iloc[-1])
+
+        signal = "BUY" if fast > slow else "SELL"
+
+        diff = abs(fast - slow)
+        confidence = min(round(diff / price * 100, 2), 100)
 
         return {
-            "price": round(close, 2),
+            "price": round(price, 2),
             "signal": signal,
-            "confidence": 0.6
+            "ema_fast": round(fast, 2),
+            "ema_slow": round(slow, 2),
+            "confidence": confidence
         }
 
     except Exception as e:
