@@ -14,13 +14,7 @@ def predict():
     try:
         data = yf.download("^NSEI", period="1d", interval="5m", progress=False)
 
-        if data.empty or len(data) < 30:
-            return {"error": "Market closed or insufficient data", "signal": "CLOSED"}
-
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-
-        last_time = data.index[-1]
+        last_time = data.index[-1] if not data.empty else datetime.utcnow()
         now_utc = datetime.utcnow()
         market_open_utc = now_utc.replace(hour=3, minute=45)
         market_close_utc = now_utc.replace(hour=10, minute=0)
@@ -30,6 +24,15 @@ def predict():
                 "signal": "CLOSED",
                 "message": "Market is closed (NSE: 9:15 AM – 3:30 PM IST)"
             }
+
+        if data.empty or len(data) < 30:
+            return {
+                "signal": "DATA ERROR",
+                "message": "Temporary data fetch issue — try reload or check yfinance status. Market should be open."
+            }
+
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
 
         market_open_today = last_time.replace(hour=3, minute=45)
         if last_time < market_open_today + pd.Timedelta(minutes=25):
@@ -53,7 +56,7 @@ def predict():
         delta = close.diff()
         gain = delta.where(delta > 0, 0).rolling(window=14).mean()
         loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
-        rs = gain / loss.replace(0, float('inf'))  # avoid div by zero
+        rs = gain / loss.replace(0, float('inf'))
         rsi = 100 - (100 / (1 + rs))
         rsi_last = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
 
@@ -62,9 +65,9 @@ def predict():
         tr3 = abs(low - close.shift())
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         atr = tr.rolling(window=14).mean()
-        atr_last = float(atr.iloc[-1]) if pd.notna(atr.iloc[-1]) else 1.0  # fallback
+        atr_last = float(atr.iloc[-1]) if pd.notna(atr.iloc[-1]) else 1.0
 
-        # Supertrend (10,3)
+        # Supertrend
         st_period = 10
         st_multiplier = 3.0
         hl2 = (high + low) / 2
@@ -85,11 +88,11 @@ def predict():
                 supertrend.iloc[i] = upper_band.iloc[i]
                 direction.iloc[i] = -1
             else:
-                supertrend.iloc[i] = supertrend.iloc[i-1]
+                supertrend.iloc[i] = supertrend.iloc[-1]
                 direction.iloc[i] = direction.iloc[i-1]
-                if direction.iloc[i] == 1 and supertrend.iloc[i] < lower_band.iloc[i]:
+                if direction.iloc[i] == 1 and supertrend.iloc[i] < lower_band[i]:
                     supertrend.iloc[i] = lower_band.iloc[i]
-                elif direction.iloc[i] == -1 and supertrend.iloc[i] > upper_band.iloc[i]:
+                elif direction.iloc[i] == -1 and supertrend.iloc[i] > upper_band[i]:
                     supertrend.iloc[i] = upper_band.iloc[i]
 
         st_last = float(supertrend.iloc[-1])
@@ -141,92 +144,88 @@ def predict():
             "confidence": confidence,
             "target": round(target, 2),
             "stop_loss": round(stop_loss, 2),
-            "time": str(last_time)
+            "time": str(last_time),
+            "ema_strength": ema_strength,
+            "rsi_strength": rsi_strength,
+            "st_strength": st_strength
         }
 
     except Exception as e:
-        return {"error": str(e)}
-
+        return {"signal": "ERROR", "message": str(e)}
 
 # ────────────────────────────────────────────────
 # Reasoning Endpoint
 # ────────────────────────────────────────────────
 @app.get("/reasoning")
 def get_reasoning():
-    try:
-        pred = predict()
+    pred = predict()
 
-        if "error" in pred or pred.get("signal") in ["CLOSED", "WAIT"]:
-            return {"reasoning": pred.get("message", "No active market data.")}
+    if "error" in pred or pred.get("signal") in ["CLOSED", "WAIT", "DATA ERROR", "ERROR"]:
+        return {"reasoning": pred.get("message", "No active market data.")}
 
-        signal = pred["signal"]
-        price = pred.get("price", "—")
-        ema_fast = pred.get("ema_fast", "—")
-        ema_slow = pred.get("ema_slow", "—")
-        rsi = pred.get("rsi", "—")
-        atr = pred.get("atr", "—")
-        confidence = pred.get("confidence", 0)
-        st_dir = pred.get("st_dir", "—")
-        supertrend = pred.get("supertrend", "—")
+    signal = pred["signal"]
+    price = pred.get("price", "—")
+    ema_fast = pred.get("ema_fast", "—")
+    ema_slow = pred.get("ema_slow", "—")
+    rsi = pred.get("rsi", "—")
+    atr = pred.get("atr", "—")
+    confidence = pred.get("confidence", 0)
+    st_dir = pred.get("st_dir", "—")
 
-        lines = [f"Current Signal: {signal}"]
-        lines.append(f"Price: {price}   EMA 9/21: {ema_fast} / {ema_slow}   RSI: {rsi}   ATR: {atr}")
+    lines = [f"Current Signal: {signal}"]
+    lines.append(f"Price: {price}   EMA 9/21: {ema_fast} / {ema_slow}   RSI: {rsi}   ATR: {atr}")
 
-        if signal == "BUY":
-            lines += [
-                "",
-                "Strong BUY setup:",
-                "• EMA 9 is above EMA 21 → short-term uptrend emerging",
-                "• RSI > 53 → clear bullish momentum (not drifting)",
-                "• Supertrend is BULLISH → price respecting lower band as support",
-                "→ Triple confirmation → higher probability long trade"
-            ]
-        elif signal == "SELL":
-            lines += [
-                "",
-                "Strong SELL setup:",
-                "• EMA 9 below EMA 21 → short-term downtrend forming",
-                "• RSI < 47 → bearish momentum confirmed",
-                "• Supertrend is BEARISH → price rejecting upper band",
-                "→ All filters aligned → good short opportunity"
-            ]
-        else:
-            lines += ["", "NEUTRAL / WAIT situation:"]
-            reasons = []
-            if abs(ema_fast - ema_slow) < atr * 0.4 if isinstance(ema_fast, (int,float)) and isinstance(ema_slow, (int,float)) and isinstance(atr, (int,float)) else True:
-                reasons.append("EMA 9 and EMA 21 are too close → no clear trend (likely ranging market)")
-            if 47 <= rsi <= 53 if isinstance(rsi, (int,float)) else False:
-                reasons.append(f"RSI {rsi} is in neutral zone → no strong momentum either way")
-            if st_dir not in ["BULLISH", "BEARISH"]:
-                reasons.append("Supertrend not decisively trending → choppy / indecisive phase")
-            if ema_fast > ema_slow and rsi <= 53 if isinstance(ema_fast, (int,float)) and isinstance(ema_slow, (int,float)) else False:
-                reasons.append("Mild EMA bullish bias but RSI not confirming → weak rally risk")
-            if ema_fast < ema_slow and rsi >= 47 if isinstance(ema_fast, (int,float)) and isinstance(ema_slow, (int,float)) else False:
-                reasons.append("Mild EMA bearish bias but lacking momentum confirmation → possible trap")
-
-            if not reasons:
-                reasons.append("Multiple small misalignments → overall indecision")
-
-            lines += [f"• {r}" for r in reasons]
-            lines.append("→ Best to wait for stronger confluence before acting")
-
+    if signal == "BUY":
         lines += [
             "",
-            f"Confidence: {confidence}%",
-            "Breakdown:",
-            f"• EMA separation contribution: \~{round(ema_strength if 'ema_strength' in locals() else 0, 1)}%",
-            f"• RSI momentum contribution: \~{round(rsi_strength if 'rsi_strength' in locals() else 0, 1)}%",
-            f"• Supertrend alignment bonus: {st_strength if 'st_strength' in locals() else 0}%"
+            "Strong BUY setup:",
+            "• EMA 9 is above EMA 21 → short-term uptrend emerging",
+            "• RSI > 53 → clear bullish momentum (not drifting)",
+            "• Supertrend is BULLISH → price respecting lower band as support",
+            "→ Triple confirmation → higher probability long trade"
         ]
+    elif signal == "SELL":
+        lines += [
+            "",
+            "Strong SELL setup:",
+            "• EMA 9 below EMA 21 → short-term downtrend forming",
+            "• RSI < 47 → bearish momentum confirmed",
+            "• Supertrend is BEARISH → price rejecting upper band",
+            "→ All filters aligned → good short opportunity"
+        ]
+    else:
+        lines += ["", "NEUTRAL / WAIT situation:"]
+        reasons = []
+        if abs(ema_fast - ema_slow) < atr * 0.4 if all(isinstance(x, float) for x in [ema_fast, ema_slow, atr]) else True:
+            reasons.append("EMA 9 and EMA 21 are too close → no clear trend (likely ranging market)")
+        if 47 <= rsi <= 53 if isinstance(rsi, float) else False:
+            reasons.append(f"RSI {rsi} is in neutral zone → no strong momentum either way")
+        if st_dir not in ["BULLISH", "BEARISH"]:
+            reasons.append("Supertrend not decisively trending → choppy / indecisive phase")
+        if ema_fast > ema_slow and rsi <= 53 if all(isinstance(x, float) for x in [ema_fast, ema_slow, rsi]) else False:
+            reasons.append("Mild EMA bullish bias but RSI not confirming → weak rally risk")
+        if ema_fast < ema_slow and rsi >= 47 if all(isinstance(x, float) for x in [ema_fast, ema_slow, rsi]) else False:
+            reasons.append("Mild EMA bearish bias but lacking momentum confirmation → possible trap")
 
-        return {"reasoning": "\n".join(lines)}
+        if not reasons:
+            reasons.append("Multiple small misalignments → overall indecision")
 
-    except Exception as e:
-        return {"reasoning": f"Error generating reasoning: {str(e)}"}
+        lines += [f"• {r}" for r in reasons]
+        lines.append("→ Best to wait for stronger confluence before acting")
 
+    lines += [
+        "",
+        f"Confidence: {confidence}%",
+        "Breakdown:",
+        f"• EMA separation contribution: \~{round(pred['ema_strength'], 1)}%",
+        f"• RSI momentum contribution: \~{round(pred['rsi_strength'], 1)}%",
+        f"• Supertrend alignment bonus: {pred['st_strength']}%"
+    ]
+
+    return {"reasoning": "\n".join(lines)}
 
 # ────────────────────────────────────────────────
-# Chart Endpoint – Full implementation
+# Chart Endpoint
 # ────────────────────────────────────────────────
 @app.get("/chart")
 def chart(interval: str = Query("5m")):
@@ -312,7 +311,6 @@ def chart(interval: str = Query("5m")):
     except Exception as e:
         return {"error": str(e)}
 
-
 # ────────────────────────────────────────────────
 # Dashboard UI
 # ────────────────────────────────────────────────
@@ -388,7 +386,7 @@ async function loadData() {
         const signalEl = document.getElementById("signal");
         if (pred.signal === "BUY") signalEl.style.color = "lime";
         else if (pred.signal === "SELL") signalEl.style.color = "red";
-        else signalEl.style.color = (pred.signal === "CLOSED" || pred.signal === "WAIT") ? "orange" : "#aaa";
+        else signalEl.style.color = (pred.signal === "CLOSED" || pred.signal === "WAIT" || pred.signal === "DATA ERROR") ? "orange" : "#aaa";
 
         document.getElementById("price").innerText = `Current Price: ${pred.price || '—'}`;
         document.getElementById("indicators").innerText = 
