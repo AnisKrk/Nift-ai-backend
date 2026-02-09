@@ -153,7 +153,7 @@ def app_ui():
 <html>
 <head>
 <title>NIFTY Intraday Predictor</title>
-<script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.min.js"></script>
 <style>
 body { background-color:#0b0c10; color:white; font-family:'Segoe UI', sans-serif; margin:0; padding:0; text-align:center;}
 header { padding:15px; background-color:#1f2833; display:flex; flex-direction:column; align-items:center; }
@@ -161,8 +161,8 @@ header h2 { margin:8px; font-size:26px; }
 header #signal { font-size:48px; margin:10px; font-weight:bold; }
 header p { margin:6px; font-size:18px; }
 #interval { margin:15px 0; padding:8px; font-size:18px; }
-#chart { width:96%; max-width:1100px; height:480px; margin:20px auto; background-color:#0b0c10; }  /* Explicit bg */
-#error-msg { color: red; font-size: 18px; margin: 10px; }
+#chart { width:96%; max-width:1100px; height:480px; margin:20px auto; background-color:#0b0c10; }
+#error-msg { color: #ff4444; font-size: 18px; margin: 10px; font-weight:bold; }
 </style>
 </head>
 
@@ -194,12 +194,11 @@ let candleSeries;
 async function loadData() {
     const interval = document.getElementById("interval").value;
     const errorEl = document.getElementById("error-msg");
-    errorEl.innerText = '';  // Clear errors
+    errorEl.innerText = '';
 
     try {
-        // Fetch prediction
         const predRes = await fetch("/");
-        if (!predRes.ok) throw new Error("Prediction API failed: " + predRes.status);
+        if (!predRes.ok) throw new Error(`Prediction failed: ${predRes.status}`);
         const pred = await predRes.json();
 
         const signalEl = document.getElementById("signal");
@@ -211,7 +210,6 @@ async function loadData() {
             signalEl.style.color = "red";
         } else {
             signalEl.style.color = "#aaa";
-            signalEl.classList.add("neutral");
         }
 
         document.getElementById("price").innerText = `Current Price: ${pred.price || '—'}`;
@@ -222,19 +220,14 @@ async function loadData() {
         document.getElementById("stop_loss").innerText = `Stop Loss: ${pred.stop_loss || '—'}`;
 
         if (pred.message) {
-            document.getElementById("confidence").innerText = pred.message;
+            document.getElementById("confidence").innerText += ` (${pred.message})`;
         }
 
-        console.log("Prediction loaded:", pred);
-
-        // Fetch chart
         const chartRes = await fetch(`/chart?interval=${interval}`);
-        if (!chartRes.ok) throw new Error("Chart API failed: " + chartRes.status);
+        if (!chartRes.ok) throw new Error(`Chart API failed: ${chartRes.status}`);
         const data = await chartRes.json();
 
-        if (data.error) throw new Error("Chart data error: " + data.error);
-
-        console.log("Chart data loaded, candles count:", data.candles.length);
+        if (data.error) throw new Error(data.error);
 
         const candlesticks = data.candles.map(c => ({
             time: new Date(c.time).getTime() / 1000,
@@ -249,7 +242,7 @@ async function loadData() {
             chart = LightweightCharts.createChart(chartDiv, {
                 width: chartDiv.clientWidth,
                 height: 480,
-                layout: { background: { type: 'solid', color: '#0b0c10' }, textColor: 'white' },  // Updated bg format
+                layout: { backgroundColor: '#0b0c10', textColor: 'white' },
                 grid: { vertLines: { color: '#333' }, horzLines: { color: '#333' } },
                 crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
                 rightPriceScale: { borderColor: '#555' },
@@ -262,25 +255,22 @@ async function loadData() {
                 wickUpColor: '#26a69a',
                 wickDownColor: '#ef5350'
             });
-            console.log("Chart initialized");
         }
 
         candleSeries.setData(candlesticks);
         chart.timeScale().fitContent();
-        console.log("Chart data set");
 
     } catch (e) {
-        errorEl.innerText = "Error loading data/chart: " + e.message;
+        errorEl.innerText = "Error: " + e.message;
         console.error(e);
     }
 }
 
 loadData();
-setInterval(loadData, 60000);  // refresh every minute
+setInterval(loadData, 60000);
 
 window.addEventListener('resize', () => {
-    const chartDiv = document.getElementById("chart");
-    if (chart) chart.applyOptions({ width: chartDiv.clientWidth });
+    if (chart) chart.applyOptions({ width: document.getElementById("chart").clientWidth });
 });
 </script>
 </body>
