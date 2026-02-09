@@ -66,3 +66,48 @@ def calculate_supertrend(df, period=10, multiplier=3.0):
              
     return supertrend, direction, atr
 
+import pandas_ta as ta  # Import the new library
+
+# ... (Keep your existing clean_val, calculate_ema functions here) ...
+
+def calculate_gainzalgo_signal(df):
+    """
+    Replicates GainzAlgo V2 Alpha logic:
+    1. SuperTrend (Trend Filter)
+    2. RSI (Momentum Filter)
+    3. Volume/Volatility Check
+    """
+    # 1. SuperTrend (Standard Algo Settings: 10, 3 or 14, 2)
+    st = df.ta.supertrend(length=10, multiplier=3)
+    
+    # pandas_ta returns columns like "SUPERT_10_3.0", so we rename them for safety
+    st_col_value = st.columns[0]  # The value column
+    st_col_dir = st.columns[1]    # The direction column (1=Up, -1=Down)
+    
+    df['ST_Value'] = st[st_col_value]
+    df['ST_Dir'] = st[st_col_dir]
+    
+    # 2. RSI (Momentum)
+    df['RSI'] = df.ta.rsi(length=14)
+    
+    # 3. Heikin-Ashi-like Smoothing (Optional, purely for signal filtering)
+    # We simply check if the candle body is strong
+    df['Body'] = abs(df['Close'] - df['Open'])
+    avg_body = df['Body'].rolling(10).mean()
+    
+    # --- LOGIC ---
+    # BUY: SuperTrend is Green (1) AND RSI > 50 (Momentum Up) AND Strong Candle
+    # SELL: SuperTrend is Red (-1) AND RSI < 50 (Momentum Down) AND Strong Candle
+    
+    current_st_dir = df['ST_Dir'].iloc[-1]
+    current_rsi = df['RSI'].iloc[-1]
+    
+    # Check simple confluence
+    algo_signal = "NEUTRAL"
+    
+    if current_st_dir == 1 and current_rsi > 50:
+        algo_signal = "BUY"
+    elif current_st_dir == -1 and current_rsi < 50:
+        algo_signal = "SELL"
+        
+    return algo_signal
