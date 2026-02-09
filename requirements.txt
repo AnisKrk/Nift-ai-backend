@@ -1,4 +1,6 @@
 fastapi
-uvicorn[standard]
+uvicorn
+yfinance
 pandas
-yfinance==0.2.43
+requests
+scipy
