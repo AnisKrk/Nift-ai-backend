@@ -24,9 +24,6 @@ async def get_dashboard_data(interval: str = "5m"):
     
     # --- CALCULATIONS ---
     close = data["Close"]
-    high = data["High"]
-    low = data["Low"]
-    volume = data["Volume"]
     
     ema_fast = calculate_ema(close, 9)
     ema_slow = calculate_ema(close, 21)
@@ -199,8 +196,21 @@ const chartContainer = document.getElementById('chart-container');
 const chart = LightweightCharts.createChart(chartContainer, {
     layout: { background: { color: '#0b0c10' }, textColor: '#d1d4dc' },
     grid: { vertLines: { color: '#1f2833' }, horzLines: { color: '#1f2833' } },
-    rightPriceScale: { borderColor: 'rgba(197, 198, 199, 0.2)' },
-    timeScale: { borderColor: 'rgba(197, 198, 199, 0.2)', timeVisible: true },
+    
+    // FIX 1: Real-time Up/Down Movement
+    rightPriceScale: { 
+        borderColor: 'rgba(197, 198, 199, 0.2)',
+        autoScale: true, // This allows the chart to move up/down dynamically
+        scaleMargins: { top: 0.1, bottom: 0.2 } // Gives space for volume at bottom
+    },
+    
+    timeScale: { 
+        borderColor: 'rgba(197, 198, 199, 0.2)', 
+        timeVisible: true,
+        // FIX 2: Prevent "Lost" Chart
+        minBarSpacing: 5, // Prevents zooming out too far into nothingness
+        rightOffset: 5,   // Adds breathing room on the right side
+    },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
 });
 
@@ -210,6 +220,7 @@ const supertrendSeries = chart.addLineSeries({ color: '#ae22e0', lineWidth: 2, t
 const emaFastSeries = chart.addLineSeries({ color: '#fdd835', lineWidth: 1, title: 'EMA 9' });
 const emaSlowSeries = chart.addLineSeries({ color: '#ff9800', lineWidth: 1, title: 'EMA 21' });
 
+// FIX 3: Flag to stop resetting zoom
 let isFirstLoad = true;
 
 async function loadData(manual = false) {
@@ -246,6 +257,8 @@ async function loadData(manual = false) {
             emaSlowSeries.setData(d.ema_slow);
             supertrendSeries.setData(d.supertrend_line);
             
+            // CRITICAL FIX: Only fit content ONCE. 
+            // After the first load, we leave the zoom level alone.
             if(isFirstLoad) {
                 chart.timeScale().fitContent();
                 isFirstLoad = false;
