@@ -1,18 +1,24 @@
-herefrom fastapi import FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, HTMLResponse
 import pandas as pd
 import traceback
-from indicators import calculate_ema, calculate_rsi, calculate_supertrend, clean_val
+# IMPORT THE NEW FUNCTION HERE
+from indicators import calculate_ema, calculate_rsi, calculate_supertrend, clean_val, calculate_gainzalgo_signal
 from market_data import get_market_data
 
 app = FastAPI()
 
-# Global Error Handler
+# ────────────────────────────────────────────────
+# GLOBAL ERROR HANDLER
+# ────────────────────────────────────────────────
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     error_msg = "".join(traceback.format_exception(None, exc, exc.__traceback__))
     return JSONResponse(status_code=500, content={"signal": "CRITICAL ERROR", "message": str(exc), "trace": error_msg})
 
+# ────────────────────────────────────────────────
+# DASHBOARD ENDPOINT
+# ────────────────────────────────────────────────
 @app.get("/")
 async def get_dashboard_data(interval: str = "5m"):
     # VALIDATE INTERVAL
@@ -29,12 +35,17 @@ async def get_dashboard_data(interval: str = "5m"):
     # --- CALCULATIONS ---
     close = data["Close"]
     
+    # 1. Standard Indicators
     ema_fast = calculate_ema(close, 9)
     ema_slow = calculate_ema(close, 21)
     rsi = calculate_rsi(close)
     supertrend, direction, atr = calculate_supertrend(data)
     
-    # Get last values
+    # 2. NEW: GainzAlgo V2 Replica Signal
+    # This uses the function you added to indicators.py in Step 2
+    algo_signal = calculate_gainzalgo_signal(data)
+    
+    # Get last values for display
     price = float(close.iloc[-1])
     fast = float(ema_fast.iloc[-1])
     slow = float(ema_slow.iloc[-1])
@@ -43,7 +54,7 @@ async def get_dashboard_data(interval: str = "5m"):
     st_dir_val = direction.iloc[-1]
     atr_last = float(atr.iloc[-1]) if pd.notna(atr.iloc[-1]) else 0.0
     
-    # Generate Signal
+    # Generate Standard Signal (EMA + RSI)
     ema_bullish = fast > slow
     ema_bearish = fast < slow
     st_bullish = st_dir_val == 1
@@ -56,12 +67,9 @@ async def get_dashboard_data(interval: str = "5m"):
     else:
         signal = "NEUTRAL"
         
-    # --- TARGET / STOP LOSS LOGIC (Restored) ---
+    # --- TARGET / STOP LOSS LOGIC ---
     risk_atr = atr_last * 1.5   # Risk 1.5x ATR
     reward_atr = atr_last * 3.0 # Reward 3.0x ATR (1:2 Ratio)
-    
-    target = 0
-    stop_loss = 0
     
     if signal == "BUY":
         target = price + reward_atr
@@ -70,7 +78,6 @@ async def get_dashboard_data(interval: str = "5m"):
         target = price - reward_atr
         stop_loss = price + risk_atr
     else:
-        # If neutral, show levels based on current price just for reference
         target = price + reward_atr
         stop_loss = price - risk_atr
 
@@ -107,6 +114,7 @@ async def get_dashboard_data(interval: str = "5m"):
 
     return {
         "signal": signal,
+        "algo_signal": algo_signal,  # <--- Sending Algo Signal to UI
         "price": clean_val(round(price, 2)),
         "rsi": clean_val(round(rsi_last, 1)),
         "supertrend": clean_val(round(st_last, 2)),
@@ -122,13 +130,16 @@ async def get_dashboard_data(interval: str = "5m"):
         "supertrend_line": supertrend_data
     }
 
+# ────────────────────────────────────────────────
+# UI ENDPOINT
+# ────────────────────────────────────────────────
 @app.get("/app", response_class=HTMLResponse)
 def app_ui():
     return """
 <!DOCTYPE html>
 <html>
 <head>
-<title>ProTrader NIFTY</title>
+<title>ProTrader NIFTY + Algo V2</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.min.js"></script>
 <style>
@@ -212,10 +223,12 @@ select { background: #333; color: white; border: none; padding: 5px; border-radi
             <div class="metric-label">RSI (14)</div>
             <div class="metric-value" id="rsi-val">--</div>
         </div>
-        <div class="metric-box">
-            <div class="metric-label">Supertrend</div>
-            <div class="metric-value" id="st-val">--</div>
+        
+        <div class="metric-box" style="border: 1px solid #66fcf1;">
+            <div class="metric-label" style="color:#66fcf1;">Algo V2</div>
+            <div class="metric-value" id="algo-val">--</div>
         </div>
+        
         <div class="metric-box">
             <div class="metric-label">Trend</div>
             <div class="metric-value" id="trend-val">--</div>
@@ -260,16 +273,14 @@ const emaSlowSeries = chart.addLineSeries({ color: '#ff9800', lineWidth: 1, titl
 
 let isFirstLoad = true;
 
-// FIX: Handle Interval Change
 function changeInterval() {
-    isFirstLoad = true; // Reset zoom on interval change
+    isFirstLoad = true;
     loadData(true);
 }
 
 async function loadData(manual = false) {
     if(manual) document.querySelector('.refresh-btn').innerText = "Loading...";
     
-    // FIX: Get value from dropdown
     const interval = document.getElementById("interval-select").value;
     
     try {
@@ -289,11 +300,14 @@ async function loadData(manual = false) {
         
         document.getElementById("price-text").innerText = "₹" + d.price;
         document.getElementById("rsi-val").innerText = d.rsi;
-        document.getElementById("st-val").innerText = d.supertrend;
         document.getElementById("trend-val").innerText = d.st_dir;
         document.getElementById("trend-val").style.color = d.st_dir === "BULLISH" ? "#26a69a" : "#ef5350";
+        
+        // NEW ALGO BOX LOGIC
+        const algoEl = document.getElementById("algo-val");
+        algoEl.innerText = d.algo_signal || "WAIT";
+        algoEl.style.color = d.algo_signal === "BUY" ? "#26a69a" : (d.algo_signal === "SELL" ? "#ef5350" : "#ffffff");
 
-        // RESTORED TARGETS
         document.getElementById("target-val").innerText = d.target || "--";
         document.getElementById("sl-val").innerText = d.stop_loss || "--";
 
