@@ -73,37 +73,53 @@ from fastapi.responses import HTMLResponse
 def app_ui():
     return """
     <html>
-    <head>
-        <title>NIFTY AI Dashboard</title>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    </head>
+<head>
+<title>NIFTY AI Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
 
-    <body style="background:black;color:white;text-align:center;font-family:sans-serif">
-        <h2>NIFTY Intraday AI</h2>
-        <canvas id="chart"></canvas>
+<body style="background:black;color:white;text-align:center;font-family:sans-serif">
 
-        <script>
-        async function loadChart(){
-            const res = await fetch("/chart");
-            const data = await res.json();
+<h2>NIFTY Intraday AI</h2>
 
-            const labels = data.candles.map(c => c.time);
-            const prices = data.candles.map(c => c.close);
+<h1 id="signal">Loading...</h1>
+<p id="price"></p>
+<p id="confidence"></p>
 
-            new Chart(document.getElementById("chart"), {
-                type: "line",
-                data: {
-                    labels: labels,
-                    datasets: [{
-                        label: "NIFTY",
-                        data: prices
-                    }]
-                }
-            });
-        }
+<canvas id="chart"></canvas>
 
-        loadChart();
-        </script>
-    </body>
-    </html>
+<script>
+async function loadData() {
+
+  const predRes = await fetch("/");
+  const pred = await predRes.json();
+
+  document.getElementById("signal").innerText = pred.signal;
+  document.getElementById("price").innerText = "Price: " + pred.price;
+  document.getElementById("confidence").innerText = "Confidence: " + pred.confidence;
+
+  const res = await fetch("/chart");
+  const data = await res.json();
+
+  const labels = data.candles.map(c => c.time);
+  const prices = data.candles.map(c => c.close);
+
+  new Chart(document.getElementById("chart"), {
+    type: "line",
+    data: {
+      labels: labels,
+      datasets: [{
+        label: "NIFTY",
+        data: prices
+      }]
+    }
+  });
+}
+
+loadData();
+setInterval(loadData, 60000);
+</script>
+
+</body>
+</html>
     """
