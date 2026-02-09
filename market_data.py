@@ -2,7 +2,6 @@ import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
 import asyncio
-from indicators import clean_val
 
 async def get_market_data(interval="5m"):
     loop = asyncio.get_event_loop()
@@ -17,21 +16,24 @@ async def get_market_data(interval="5m"):
         data.columns = data.columns.get_level_values(0)
 
     # Calculate Market Status
-    # If the last candle is older than 10 minutes, market is likely closed
     last_time = data.index[-1]
-    now_utc = datetime.utcnow()
-    # Adjust last_time to UTC if it's naive, assuming input is UTC-ish from Yahoo
-    if last_time.tzinfo is None:
-        # Yahoo often returns naive timestamps, usually in local market time or UTC
-        # We'll assume the difference check handles the "live" status roughly
-        pass
+    
+    # FIX: Handle Timezones correctly (UTC -> IST)
+    # Yahoo often returns data in UTC or local time with offsets.
+    # We normalize to naive (no timezone) then add 5:30 manually for display.
+    if last_time.tzinfo is not None:
+        last_time = last_time.replace(tzinfo=None)
         
-    is_market_open = (datetime.utcnow() - last_time.replace(tzinfo=None)) < timedelta(minutes=15)
+    # Add 5 hours and 30 minutes to get IST
+    ist_time = last_time + timedelta(hours=5, minutes=30)
+    
+    # Check if market is open (compare UTC server time vs UTC data time)
+    # If the last data point is less than 15 mins old, market is OPEN.
+    is_market_open = (datetime.utcnow() - last_time) < timedelta(minutes=15)
     status = "OPEN" if is_market_open else "CLOSED"
 
     return {
         "data": data,
         "status": status,
-        "last_updated": last_time.strftime("%H:%M:%S")
+        "last_updated": ist_time.strftime("%H:%M:%S") # <--- Sends IST time to your screen
     }, None
-
