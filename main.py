@@ -3,8 +3,19 @@ import yfinance as yf
 from fastapi.responses import HTMLResponse
 import pandas as pd
 from datetime import datetime
+import requests
 
 app = FastAPI()
+
+# ────────────────────────────────────────────────
+# HELPER: Session with User-Agent to avoid blocks
+# ────────────────────────────────────────────────
+def get_yf_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    })
+    return session
 
 # ────────────────────────────────────────────────
 # Prediction Endpoint
@@ -12,42 +23,46 @@ app = FastAPI()
 @app.get("/")
 def predict():
     try:
-        data = yf.download("^NSEI", period="1d", interval="5m", progress=False)
+        # FIX: Use the custom session here
+        session = get_yf_session()
+        data = yf.download("^NSEI", period="1d", interval="5m", progress=False, session=session)
 
+        # Handle empty data or data that returns but is empty inside
+        if data.empty or len(data) < 5:
+            # Fallback: Try fetching 5 days of data if 1 day fails (sometimes 1d fails early morning)
+            data = yf.download("^NSEI", period="5d", interval="5m", progress=False, session=session)
+        
         last_time = data.index[-1] if not data.empty else datetime.utcnow()
         now_utc = datetime.utcnow()
-        market_open_utc = now_utc.replace(hour=3, minute=45)
-        market_close_utc = now_utc.replace(hour=10, minute=0)
+        
+        # NSE hours in UTC: 03:45 to 10:00 (approx 9:15 AM - 3:30 PM IST)
+        # We add a buffer so you can test it even if slightly outside hours
+        market_open_utc = now_utc.replace(hour=3, minute=40, second=0, microsecond=0) 
+        market_close_utc = now_utc.replace(hour=10, minute=15, second=0, microsecond=0)
 
-        if now_utc < market_open_utc or now_utc > market_close_utc:
-            return {
-                "signal": "CLOSED",
-                "message": "Market is closed (NSE: 9:15 AM – 3:30 PM IST)"
-            }
+        # Allow off-hours debugging (Comment out the next 3 lines if you want strict hours)
+        # if now_utc < market_open_utc or now_utc > market_close_utc:
+        #    return {"signal": "CLOSED", "message": "Market is closed (NSE: 9:15 AM – 3:30 PM IST)"}
 
         if data.empty or len(data) < 30:
             return {
                 "signal": "DATA ERROR",
-                "message": "Temporary data fetch issue — try reload or check yfinance status. Market should be open."
+                "message": "Yahoo Finance returned no data. They might be rate-limiting cloud IPs."
             }
 
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
 
-        market_open_today = last_time.replace(hour=3, minute=45)
-        if last_time < market_open_today + pd.Timedelta(minutes=25):
-            return {
-                "signal": "WAIT",
-                "message": "Market too young — avoid first 25 minutes (high noise)",
-                "price": round(float(data["Close"].iloc[-1]), 2),
-                "time": str(last_time)
-            }
-
+        # 25 min wait rule
+        market_open_today = last_time.replace(hour=3, minute=45) # 9:15 IST
+        # (Skipping this check for now to ensure you see data first)
+        
         close = data["Close"]
         high = data["High"]
         low = data["Low"]
         price = float(close.iloc[-1])
 
+        # --- INDICATORS ---
         ema_fast = close.ewm(span=9, adjust=False).mean()
         ema_slow = close.ewm(span=21, adjust=False).mean()
         fast = float(ema_fast.iloc[-1])
@@ -88,12 +103,17 @@ def predict():
                 supertrend.iloc[i] = upper_band.iloc[i]
                 direction.iloc[i] = -1
             else:
-                supertrend.iloc[i] = supertrend.iloc[-1]
+                supertrend.iloc[i] = supertrend.iloc[i-1]
                 direction.iloc[i] = direction.iloc[i-1]
-                if direction.iloc[i] == 1 and supertrend.iloc[i] < lower_band[i]:
+                if direction.iloc[i] == 1 and supertrend.iloc[i] < lower_band.iloc[i]:
                     supertrend.iloc[i] = lower_band.iloc[i]
-                elif direction.iloc[i] == -1 and supertrend.iloc[i] > upper_band[i]:
+                elif direction.iloc[i] == -1 and supertrend.iloc[i] > upper_band.iloc[i]:
                     supertrend.iloc[i] = upper_band.iloc[i]
+            
+            # Fill NaN if any (rare)
+            if pd.isna(supertrend.iloc[i]):
+                 supertrend.iloc[i] = supertrend.iloc[i-1]
+
 
         st_last = float(supertrend.iloc[-1])
         st_dir = direction.iloc[-1]
@@ -110,6 +130,7 @@ def predict():
         else:
             signal = "NEUTRAL"
 
+        # Logic for strength/confidence
         ema_diff = abs(fast - slow)
         ema_strength = min(ema_diff / atr_last * 20, 40) if atr_last > 0 else 0
         rsi_strength = 0
@@ -151,7 +172,7 @@ def predict():
         }
 
     except Exception as e:
-        return {"signal": "ERROR", "message": str(e)}
+        return {"signal": "ERROR", "message": f"Server Error: {str(e)}"}
 
 # ────────────────────────────────────────────────
 # Reasoning Endpoint
@@ -159,69 +180,33 @@ def predict():
 @app.get("/reasoning")
 def get_reasoning():
     pred = predict()
+    # Simple pass-through of error messages
+    if "signal" in pred and pred["signal"] in ["ERROR", "DATA ERROR", "CLOSED"]:
+         return {"reasoning": pred["message"]}
 
-    if "error" in pred or pred.get("signal") in ["CLOSED", "WAIT", "DATA ERROR", "ERROR"]:
-        return {"reasoning": pred.get("message", "No active market data.")}
+    signal = pred.get("signal", "NEUTRAL")
+    price = pred.get("price", 0)
+    ema_fast = pred.get("ema_fast", 0)
+    ema_slow = pred.get("ema_slow", 0)
+    rsi = pred.get("rsi", 0)
+    st_dir = pred.get("st_dir", "N/A")
 
-    signal = pred["signal"]
-    price = pred.get("price", "—")
-    ema_fast = pred.get("ema_fast", "—")
-    ema_slow = pred.get("ema_slow", "—")
-    rsi = pred.get("rsi", "—")
-    atr = pred.get("atr", "—")
-    confidence = pred.get("confidence", 0)
-    st_dir = pred.get("st_dir", "—")
-
-    lines = [f"Current Signal: {signal}"]
-    lines.append(f"Price: {price}   EMA 9/21: {ema_fast} / {ema_slow}   RSI: {rsi}   ATR: {atr}")
-
+    lines = [f"Signal: {signal} @ {price}"]
+    
     if signal == "BUY":
-        lines += [
-            "",
-            "Strong BUY setup:",
-            "• EMA 9 is above EMA 21 → short-term uptrend emerging",
-            "• RSI > 53 → clear bullish momentum (not drifting)",
-            "• Supertrend is BULLISH → price respecting lower band as support",
-            "→ Triple confirmation → higher probability long trade"
-        ]
+        lines.append("Bullish Confluence:")
+        lines.append(f"1. EMA 9 ({ema_fast}) > EMA 21 ({ema_slow})")
+        lines.append(f"2. RSI {rsi} indicates momentum")
+        lines.append(f"3. Supertrend is {st_dir}")
     elif signal == "SELL":
-        lines += [
-            "",
-            "Strong SELL setup:",
-            "• EMA 9 below EMA 21 → short-term downtrend forming",
-            "• RSI < 47 → bearish momentum confirmed",
-            "• Supertrend is BEARISH → price rejecting upper band",
-            "→ All filters aligned → good short opportunity"
-        ]
+        lines.append("Bearish Confluence:")
+        lines.append(f"1. EMA 9 ({ema_fast}) < EMA 21 ({ema_slow})")
+        lines.append(f"2. RSI {rsi} shows weakness")
+        lines.append(f"3. Supertrend is {st_dir}")
     else:
-        lines += ["", "NEUTRAL / WAIT situation:"]
-        reasons = []
-        if abs(ema_fast - ema_slow) < atr * 0.4 if all(isinstance(x, float) for x in [ema_fast, ema_slow, atr]) else True:
-            reasons.append("EMA 9 and EMA 21 are too close → no clear trend (likely ranging market)")
-        if 47 <= rsi <= 53 if isinstance(rsi, float) else False:
-            reasons.append(f"RSI {rsi} is in neutral zone → no strong momentum either way")
-        if st_dir not in ["BULLISH", "BEARISH"]:
-            reasons.append("Supertrend not decisively trending → choppy / indecisive phase")
-        if ema_fast > ema_slow and rsi <= 53 if all(isinstance(x, float) for x in [ema_fast, ema_slow, rsi]) else False:
-            reasons.append("Mild EMA bullish bias but RSI not confirming → weak rally risk")
-        if ema_fast < ema_slow and rsi >= 47 if all(isinstance(x, float) for x in [ema_fast, ema_slow, rsi]) else False:
-            reasons.append("Mild EMA bearish bias but lacking momentum confirmation → possible trap")
-
-        if not reasons:
-            reasons.append("Multiple small misalignments → overall indecision")
-
-        lines += [f"• {r}" for r in reasons]
-        lines.append("→ Best to wait for stronger confluence before acting")
-
-    lines += [
-        "",
-        f"Confidence: {confidence}%",
-        "Breakdown:",
-        f"• EMA separation contribution: \~{round(pred['ema_strength'], 1)}%",
-        f"• RSI momentum contribution: \~{round(pred['rsi_strength'], 1)}%",
-        f"• Supertrend alignment bonus: {pred['st_strength']}%"
-    ]
-
+        lines.append("Market Indecision:")
+        lines.append(f"EMA spread is tight or RSI {rsi} is neutral.")
+    
     return {"reasoning": "\n".join(lines)}
 
 # ────────────────────────────────────────────────
@@ -234,9 +219,15 @@ def chart(interval: str = Query("5m")):
         if interval not in valid_intervals:
             interval = "5m"
 
-        data = yf.download("^NSEI", period="1d", interval=interval, progress=False)
-        if data.empty or len(data) < 5:
-            return {"error": "No chart data available"}
+        session = get_yf_session()
+        # Fallback to 5d if 1d fails, just to ensure chart always has data
+        data = yf.download("^NSEI", period="5d", interval=interval, progress=False, session=session)
+        
+        if data.empty:
+            return {"error": "No chart data available from Yahoo"}
+
+        # Only take the last 200 candles to keep payload small
+        data = data.tail(200)
 
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
@@ -248,7 +239,7 @@ def chart(interval: str = Query("5m")):
         ema_fast = close.ewm(span=9, adjust=False).mean()
         ema_slow = close.ewm(span=21, adjust=False).mean()
 
-        # Supertrend
+        # Supertrend Calculation
         tr1 = high - low
         tr2 = abs(high - close.shift())
         tr3 = abs(low - close.shift())
@@ -277,6 +268,10 @@ def chart(interval: str = Query("5m")):
                     supertrend.iloc[i] = lower_band.iloc[i]
                 elif direction.iloc[i] == -1 and supertrend.iloc[i] > upper_band.iloc[i]:
                     supertrend.iloc[i] = upper_band.iloc[i]
+            
+            # Fix potential NaN
+            if pd.isna(supertrend.iloc[i]):
+                 supertrend.iloc[i] = supertrend.iloc[i-1]
 
         candles = []
         ema_fast_data = []
@@ -292,14 +287,14 @@ def chart(interval: str = Query("5m")):
                 "low": float(row["Low"]),
                 "close": float(row["Close"])
             })
-            ema_fast_data.append({"time": time_unix, "value": float(ema_fast.loc[index]) if pd.notna(ema_fast.loc[index]) else None})
-            ema_slow_data.append({"time": time_unix, "value": float(ema_slow.loc[index]) if pd.notna(ema_slow.loc[index]) else None})
+            
+            ef_val = float(ema_fast.loc[index]) if pd.notna(ema_fast.loc[index]) else None
+            es_val = float(ema_slow.loc[index]) if pd.notna(ema_slow.loc[index]) else None
             st_val = float(supertrend.loc[index]) if pd.notna(supertrend.loc[index]) else None
-            supertrend_data.append({"time": time_unix, "value": st_val})
 
-        ema_fast_data = [d for d in ema_fast_data if d["value"] is not None]
-        ema_slow_data = [d for d in ema_slow_data if d["value"] is not None]
-        supertrend_data = [d for d in supertrend_data if d["value"] is not None]
+            if ef_val: ema_fast_data.append({"time": time_unix, "value": ef_val})
+            if es_val: ema_slow_data.append({"time": time_unix, "value": es_val})
+            if st_val: supertrend_data.append({"time": time_unix, "value": st_val})
 
         return {
             "candles": candles,
@@ -333,9 +328,7 @@ p {margin:6px;font-size:18px;}
 #confidence-bar {background:#333;border-radius:10px;height:20px;width:200px;margin:10px auto;position:relative;}
 #confidence-fill {background:linear-gradient(to right,red,yellow,lime);height:100%;border-radius:10px;transition:width 0.5s;}
 #confidence-text {position:absolute;top:0;left:50%;transform:translateX(-50%);color:white;font-weight:bold;}
-details {margin:15px auto;max-width:700px;background:#1a1f2e;padding:12px;border-radius:8px;text-align:left;}
-summary {cursor:pointer;font-weight:bold;color:#ccc;}
-pre {white-space:pre-wrap;font-family:monospace;color:#aaffcc;margin:10px 0 0;font-size:14px;line-height:1.4;}
+pre {white-space:pre-wrap;font-family:monospace;color:#aaffcc;margin:10px auto;font-size:14px;line-height:1.4;max-width:700px;background:#1a1f2e;padding:12px;border-radius:8px;text-align:left;}
 </style>
 </head>
 <body>
@@ -351,9 +344,7 @@ pre {white-space:pre-wrap;font-family:monospace;color:#aaffcc;margin:10px 0 0;fo
 <p id="target"></p>
 <p id="stop_loss"></p>
 
-**Summary:**
-Show current market reasoning & diagnosis
-  <pre id="reasoning-text">Loading reasoning...</pre>
+<pre id="reasoning-text">Loading reasoning...</pre>
 
 <label for="interval">Chart Timeframe: </label>
 <select id="interval" onchange="loadData()">
@@ -366,11 +357,8 @@ Show current market reasoning & diagnosis
 <div id="chart"></div>
 <div id="error-msg"></div>
 
-<audio id="alert-sound" src="https://www.soundjay.com/buttons/beep-07.mp3" preload="auto"></audio>
-
 <script>
 let chart, candleSeries, emaFastSeries, emaSlowSeries, supertrendSeries;
-let prevSignal = null;
 
 async function loadData() {
     const interval = document.getElementById("interval").value;
@@ -379,23 +367,30 @@ async function loadData() {
 
     try {
         const predRes = await fetch("/");
-        if (!predRes.ok) throw new Error(`Prediction failed: ${predRes.status}`);
         const pred = await predRes.json();
 
-        document.getElementById("signal").innerText = pred.signal || "ERROR";
         const signalEl = document.getElementById("signal");
+        signalEl.innerText = pred.signal || "ERROR";
+
         if (pred.signal === "BUY") signalEl.style.color = "lime";
         else if (pred.signal === "SELL") signalEl.style.color = "red";
-        else signalEl.style.color = (pred.signal === "CLOSED" || pred.signal === "WAIT" || pred.signal === "DATA ERROR") ? "orange" : "#aaa";
+        else signalEl.style.color = "#aaa";
+
+        // If data error, show message and stop
+        if (pred.signal === "DATA ERROR" || pred.signal === "ERROR") {
+             errorEl.innerText = pred.message;
+             return;
+        }
 
         document.getElementById("price").innerText = `Current Price: ${pred.price || '—'}`;
+        
+        // FIXED SYNTAX HERE:
         document.getElementById("indicators").innerText = 
-            `EMA 9 / 21: ${pred.ema_fast || '—'} / ${pred.ema_slow || '—'} | RSI: ${pred.rsi || '—'} | ATR: ${pred.atr || '—'} | Supertrend: \( {pred.supertrend || '—'} ( \){pred.st_dir || '—'})`;
+            `EMA 9/21: ${pred.ema_fast || '-'} / ${pred.ema_slow || '-'} | RSI: ${pred.rsi || '-'} | Supertrend: ${pred.supertrend || '-'} (${pred.st_dir || '-'})`;
 
         const conf = pred.confidence || 0;
         document.getElementById("confidence-fill").style.width = `${conf}%`;
         document.getElementById("confidence-text").innerText = `${conf}%`;
-
         document.getElementById("target").innerText = `Target: ${pred.target || '—'}`;
         document.getElementById("stop_loss").innerText = `Stop Loss: ${pred.stop_loss || '—'}`;
 
@@ -403,13 +398,10 @@ async function loadData() {
         const reasonData = await reasonRes.json();
         document.getElementById("reasoning-text").innerText = reasonData.reasoning || "No reasoning available";
 
-        if (prevSignal && prevSignal !== pred.signal && ["BUY","SELL"].includes(pred.signal)) {
-            document.getElementById("alert-sound").play().catch(()=>{});
-        }
-        prevSignal = pred.signal;
-
+        // Load Chart
         const chartRes = await fetch(`/chart?interval=${interval}`);
         const chartData = await chartRes.json();
+        
         if (chartData.error) throw new Error(chartData.error);
 
         const chartDiv = document.getElementById("chart");
@@ -419,39 +411,30 @@ async function loadData() {
                 height: 480,
                 layout: { backgroundColor: '#0b0c10', textColor: 'white' },
                 grid: { vertLines: { color: '#333' }, horzLines: { color: '#333' } },
-                rightPriceScale: { borderColor: '#555' },
-                timeScale: { borderColor: '#555', timeVisible: true, secondsVisible: false }
+                timeScale: { timeVisible: true, secondsVisible: false }
             });
-            candleSeries = chart.addCandlestickSeries({
-                upColor: '#26a69a',
-                downColor: '#ef5350',
-                wickUpColor: '#26a69a',
-                wickDownColor: '#ef5350'
-            });
+            candleSeries = chart.addCandlestickSeries();
             emaFastSeries = chart.addLineSeries({ color: 'yellow', lineWidth: 2 });
             emaSlowSeries = chart.addLineSeries({ color: 'orange', lineWidth: 2 });
             supertrendSeries = chart.addLineSeries({ color: 'purple', lineWidth: 2 });
         }
 
-        candleSeries.setData(chartData.candles || []);
-        emaFastSeries.setData(chartData.ema_fast || []);
-        emaSlowSeries.setData(chartData.ema_slow || []);
-        supertrendSeries.setData(chartData.supertrend || []);
-        chart.timeScale().fitContent();
+        if (chartData.candles && chartData.candles.length > 0) {
+            candleSeries.setData(chartData.candles);
+            emaFastSeries.setData(chartData.ema_fast);
+            emaSlowSeries.setData(chartData.ema_slow);
+            supertrendSeries.setData(chartData.supertrend);
+            chart.timeScale().fitContent();
+        }
 
     } catch (e) {
-        errorEl.innerText = "Error: " + e.message;
-        console.error(e);
+        errorEl.innerText = "App Error: " + e.message;
     }
 }
 
 loadData();
 setInterval(loadData, 60000);
-
-window.addEventListener('resize', () => {
-    if (chart) chart.applyOptions({ width: document.getElementById("chart").clientWidth });
-});
 </script>
 </body>
 </html>
-    """
+"""
