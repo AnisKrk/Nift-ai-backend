@@ -22,10 +22,10 @@ def predict():
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
 
-        # Time awareness (IST market hours roughly 9:15 - 15:30)
-        last_time = data.index[-1]
-        market_open = last_time.replace(hour=9, minute=15)
-        if last_time < market_open + pd.Timedelta(minutes=25):
+        # Time awareness (NSE opens at 9:15 IST = 3:45 UTC)
+        last_time = data.index[-1]  # UTC timezone
+        market_open_utc = last_time.replace(hour=3, minute=45)  # UTC equivalent of 9:15 IST
+        if last_time < market_open_utc + pd.Timedelta(minutes=25):
             return {
                 "signal": "WAIT",
                 "message": "Market too young — avoid first 25 minutes (high noise)",
@@ -145,7 +145,7 @@ def chart(interval: str = Query("5m")):
         return {"error": str(e)}
 
 # -----------------------------
-# Dashboard UI — added RSI & ATR display + neutral color
+# Dashboard UI — added RSI & ATR display + neutral color + error handling in JS
 # -----------------------------
 @app.get("/app", response_class=HTMLResponse)
 def app_ui():
@@ -161,8 +161,8 @@ header h2 { margin:8px; font-size:26px; }
 header #signal { font-size:48px; margin:10px; font-weight:bold; }
 header p { margin:6px; font-size:18px; }
 #interval { margin:15px 0; padding:8px; font-size:18px; }
-#chart { width:96%; max-width:1100px; height:480px; margin:20px auto; }
-.neutral { color: #aaa !important; }
+#chart { width:96%; max-width:1100px; height:480px; margin:20px auto; background-color:#0b0c10; }  /* Explicit bg */
+#error-msg { color: red; font-size: 18px; margin: 10px; }
 </style>
 </head>
 
@@ -185,6 +185,7 @@ header p { margin:6px; font-size:18px; }
 </header>
 
 <div id="chart"></div>
+<div id="error-msg"></div>
 
 <script>
 let chart;
@@ -192,77 +193,94 @@ let candleSeries;
 
 async function loadData() {
     const interval = document.getElementById("interval").value;
+    const errorEl = document.getElementById("error-msg");
+    errorEl.innerText = '';  // Clear errors
 
-    // Fetch prediction
-    const predRes = await fetch("/");
-    const pred = await predRes.json();
+    try {
+        // Fetch prediction
+        const predRes = await fetch("/");
+        if (!predRes.ok) throw new Error("Prediction API failed: " + predRes.status);
+        const pred = await predRes.json();
 
-    const signalEl = document.getElementById("signal");
-    signalEl.innerText = pred.signal || "ERROR";
-    
-    if (pred.signal === "BUY") {
-        signalEl.style.color = "lime";
-    } else if (pred.signal === "SELL") {
-        signalEl.style.color = "red";
-    } else {
-        signalEl.style.color = "#aaa";
-        signalEl.classList.add("neutral");
+        const signalEl = document.getElementById("signal");
+        signalEl.innerText = pred.signal || "ERROR";
+        
+        if (pred.signal === "BUY") {
+            signalEl.style.color = "lime";
+        } else if (pred.signal === "SELL") {
+            signalEl.style.color = "red";
+        } else {
+            signalEl.style.color = "#aaa";
+            signalEl.classList.add("neutral");
+        }
+
+        document.getElementById("price").innerText = `Current Price: ${pred.price || '—'}`;
+        document.getElementById("indicators").innerText = 
+            `EMA 9 / 21: ${pred.ema_fast || '—'} / ${pred.ema_slow || '—'}   |   RSI: ${pred.rsi || '—'}   |   ATR: ${pred.atr || '—'}`;
+        document.getElementById("confidence").innerText = `Confidence: ${pred.confidence || '—'}%`;
+        document.getElementById("target").innerText = `Target: ${pred.target || '—'}`;
+        document.getElementById("stop_loss").innerText = `Stop Loss: ${pred.stop_loss || '—'}`;
+
+        if (pred.message) {
+            document.getElementById("confidence").innerText = pred.message;
+        }
+
+        console.log("Prediction loaded:", pred);
+
+        // Fetch chart
+        const chartRes = await fetch(`/chart?interval=${interval}`);
+        if (!chartRes.ok) throw new Error("Chart API failed: " + chartRes.status);
+        const data = await chartRes.json();
+
+        if (data.error) throw new Error("Chart data error: " + data.error);
+
+        console.log("Chart data loaded, candles count:", data.candles.length);
+
+        const candlesticks = data.candles.map(c => ({
+            time: new Date(c.time).getTime() / 1000,
+            open: c.open,
+            high: c.high,
+            low: c.low,
+            close: c.close
+        }));
+
+        const chartDiv = document.getElementById("chart");
+        if (!chart) {
+            chart = LightweightCharts.createChart(chartDiv, {
+                width: chartDiv.clientWidth,
+                height: 480,
+                layout: { background: { type: 'solid', color: '#0b0c10' }, textColor: 'white' },  // Updated bg format
+                grid: { vertLines: { color: '#333' }, horzLines: { color: '#333' } },
+                crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                rightPriceScale: { borderColor: '#555' },
+                timeScale: { borderColor: '#555', timeVisible: true, secondsVisible: false }
+            });
+            candleSeries = chart.addCandlestickSeries({
+                upColor: '#26a69a',
+                downColor: '#ef5350',
+                borderVisible: false,
+                wickUpColor: '#26a69a',
+                wickDownColor: '#ef5350'
+            });
+            console.log("Chart initialized");
+        }
+
+        candleSeries.setData(candlesticks);
+        chart.timeScale().fitContent();
+        console.log("Chart data set");
+
+    } catch (e) {
+        errorEl.innerText = "Error loading data/chart: " + e.message;
+        console.error(e);
     }
-
-    document.getElementById("price").innerText = `Current Price: ${pred.price || '—'}`;
-    document.getElementById("indicators").innerText = 
-        `EMA 9 / 21: ${pred.ema_fast || '—'} / ${pred.ema_slow || '—'}   |   RSI: ${pred.rsi || '—'}   |   ATR: ${pred.atr || '—'}`;
-    document.getElementById("confidence").innerText = `Confidence: ${pred.confidence || '—'}%`;
-    document.getElementById("target").innerText = `Target: ${pred.target || '—'}`;
-    document.getElementById("stop_loss").innerText = `Stop Loss: ${pred.stop_loss || '—'}`;
-
-    if (pred.message) {
-        document.getElementById("confidence").innerText = pred.message;
-    }
-
-    // Fetch chart
-    const res = await fetch(`/chart?interval=${interval}`);
-    const data = await res.json();
-
-    if (data.error) return;
-
-    const candlesticks = data.candles.map(c => ({
-        time: new Date(c.time).getTime() / 1000,
-        open: c.open,
-        high: c.high,
-        low: c.low,
-        close: c.close
-    }));
-
-    const chartDiv = document.getElementById("chart");
-    if (!chart) {
-        chart = LightweightCharts.createChart(chartDiv, {
-            width: chartDiv.clientWidth,
-            height: 480,
-            layout: { backgroundColor: '#0b0c10', textColor: 'white' },
-            grid: { vertLines: { color: '#333' }, horzLines: { color: '#333' } },
-            crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-            rightPriceScale: { borderColor: '#555' },
-            timeScale: { borderColor: '#555', timeVisible: true, secondsVisible: false }
-        });
-        candleSeries = chart.addCandlestickSeries({
-            upColor: '#26a69a',
-            downColor: '#ef5350',
-            borderVisible: false,
-            wickUpColor: '#26a69a',
-            wickDownColor: '#ef5350'
-        });
-    }
-
-    candleSeries.setData(candlesticks);
-    chart.timeScale().fitContent();
 }
 
 loadData();
 setInterval(loadData, 60000);  // refresh every minute
 
 window.addEventListener('resize', () => {
-    if (chart) chart.applyOptions({ width: document.getElementById("chart").clientWidth });
+    const chartDiv = document.getElementById("chart");
+    if (chart) chart.applyOptions({ width: chartDiv.clientWidth });
 });
 </script>
 </body>
