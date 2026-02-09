@@ -31,3 +31,31 @@ def home():
 
     except Exception as e:
         return {"error": str(e)}
+
+@app.get("/chart")
+def chart():
+    try:
+        data = yf.download("^NSEI", period="1d", interval="5m", progress=False)
+
+        if data.empty:
+            return {"error": "No chart data available"}
+
+        # Handle multi-index columns
+        if len(data["Close"].shape) > 1:
+            data.columns = data.columns.get_level_values(0)
+
+        candles = []
+
+        for index, row in data.iterrows():
+            candles.append({
+                "time": str(index),
+                "open": float(row["Open"]),
+                "high": float(row["High"]),
+                "low": float(row["Low"]),
+                "close": float(row["Close"])
+            })
+
+        return {"candles": candles}
+
+    except Exception as e:
+        return {"error": str(e)}
