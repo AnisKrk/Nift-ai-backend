@@ -2,5 +2,4 @@ fastapi
 uvicorn
 yfinance
 pandas
-requests
-scipy
+curl-cffi
