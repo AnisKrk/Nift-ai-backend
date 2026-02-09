@@ -1,37 +1,51 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, HTMLResponse
 import yfinance as yf
-from fastapi.responses import HTMLResponse
 import pandas as pd
 from datetime import datetime
+import asyncio
+import traceback
 
 app = FastAPI()
+
+# ────────────────────────────────────────────────
+# GLOBAL ERROR HANDLER
+# This catches "Internal Server Error" and prints the real reason
+# ────────────────────────────────────────────────
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    error_msg = "".join(traceback.format_exception(None, exc, exc.__traceback__))
+    return JSONResponse(
+        status_code=500,
+        content={"signal": "CRITICAL ERROR", "message": f"Server Crash: {str(exc)}", "trace": error_msg}
+    )
 
 # ────────────────────────────────────────────────
 # Prediction Endpoint
 # ────────────────────────────────────────────────
 @app.get("/")
-def predict():
+async def predict():
     try:
-        # NOTE: We removed the custom session here. 
-        # yfinance will now automatically use 'curl_cffi' (if installed) to bypass blocks.
-        data = yf.download("^NSEI", period="1d", interval="5m", progress=False)
+        # FIX: Run yfinance in a separate thread to prevent "curl_cffi" crashes
+        # This isolates the download process from the web server loop
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: yf.download("^NSEI", period="1d", interval="5m", progress=False))
 
-        # Fallback: Try fetching 5 days if 1 day fails or is empty
+        # Fallback if 1d is empty (common in early morning)
         if data.empty or len(data) < 5:
-            data = yf.download("^NSEI", period="5d", interval="5m", progress=False)
-        
-        last_time = data.index[-1] if not data.empty else datetime.utcnow()
-        
-        # Check if data is still empty after fallback
-        if data.empty or len(data) < 5:
+            data = await loop.run_in_executor(None, lambda: yf.download("^NSEI", period="5d", interval="5m", progress=False))
+
+        # Check if data is still empty
+        if data.empty:
             return {
-                "signal": "DATA ERROR",
-                "message": "Yahoo Finance is blocking data. Ensure 'curl-cffi' is in requirements.txt"
+                "signal": "DATA ERROR", 
+                "message": "Yahoo returned no data. Try clearing Render cache and redeploying."
             }
 
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
         
+        last_time = data.index[-1]
         close = data["Close"]
         high = data["High"]
         low = data["Low"]
@@ -103,7 +117,7 @@ def predict():
         else:
             signal = "NEUTRAL"
 
-        # Logic for strength/confidence
+        # Confidence Calculation
         ema_diff = abs(fast - slow)
         ema_strength = min(ema_diff / atr_last * 20, 40) if atr_last > 0 else 0
         rsi_strength = 0
@@ -138,61 +152,60 @@ def predict():
             "confidence": confidence,
             "target": round(target, 2),
             "stop_loss": round(stop_loss, 2),
-            "time": str(last_time),
-            "ema_strength": ema_strength,
-            "rsi_strength": rsi_strength,
-            "st_strength": st_strength
+            "time": str(last_time)
         }
 
     except Exception as e:
-        return {"signal": "ERROR", "message": f"Server Error: {str(e)}"}
+        # This will now be caught by the global handler if it's a hard crash,
+        # but for logic errors, we return this:
+        return {"signal": "ERROR", "message": f"Logic Error: {str(e)}"}
 
 # ────────────────────────────────────────────────
 # Reasoning Endpoint
 # ────────────────────────────────────────────────
 @app.get("/reasoning")
-def get_reasoning():
-    pred = predict()
-    if "signal" in pred and pred["signal"] in ["ERROR", "DATA ERROR", "CLOSED"]:
-         return {"reasoning": pred["message"]}
+async def get_reasoning():
+    try:
+        pred = await predict()
+        if "signal" in pred and pred["signal"] in ["ERROR", "DATA ERROR", "CRITICAL ERROR"]:
+             return {"reasoning": pred["message"]}
 
-    signal = pred.get("signal", "NEUTRAL")
-    price = pred.get("price", 0)
-    ema_fast = pred.get("ema_fast", 0)
-    ema_slow = pred.get("ema_slow", 0)
-    rsi = pred.get("rsi", 0)
-    st_dir = pred.get("st_dir", "N/A")
+        signal = pred.get("signal", "NEUTRAL")
+        price = pred.get("price", 0)
+        ema_fast = pred.get("ema_fast", 0)
+        ema_slow = pred.get("ema_slow", 0)
+        rsi = pred.get("rsi", 0)
+        st_dir = pred.get("st_dir", "N/A")
 
-    lines = [f"Signal: {signal} @ {price}"]
-    
-    if signal == "BUY":
-        lines.append("Bullish Confluence:")
-        lines.append(f"1. EMA 9 ({ema_fast}) > EMA 21 ({ema_slow})")
-        lines.append(f"2. RSI {rsi} indicates momentum")
-        lines.append(f"3. Supertrend is {st_dir}")
-    elif signal == "SELL":
-        lines.append("Bearish Confluence:")
-        lines.append(f"1. EMA 9 ({ema_fast}) < EMA 21 ({ema_slow})")
-        lines.append(f"2. RSI {rsi} shows weakness")
-        lines.append(f"3. Supertrend is {st_dir}")
-    else:
-        lines.append("Market Indecision:")
-        lines.append(f"EMA spread is tight or RSI {rsi} is neutral.")
-    
-    return {"reasoning": "\n".join(lines)}
+        lines = [f"Signal: {signal} @ {price}"]
+        
+        if signal == "BUY":
+            lines.append("Bullish Confluence:")
+            lines.append(f"1. EMA 9 ({ema_fast}) > EMA 21 ({ema_slow})")
+            lines.append(f"2. RSI {rsi} indicates momentum")
+            lines.append(f"3. Supertrend is {st_dir}")
+        elif signal == "SELL":
+            lines.append("Bearish Confluence:")
+            lines.append(f"1. EMA 9 ({ema_fast}) < EMA 21 ({ema_slow})")
+            lines.append(f"2. RSI {rsi} shows weakness")
+            lines.append(f"3. Supertrend is {st_dir}")
+        else:
+            lines.append("Market Indecision:")
+            lines.append(f"EMA spread is tight or RSI {rsi} is neutral.")
+        
+        return {"reasoning": "\n".join(lines)}
+    except Exception as e:
+        return {"reasoning": f"Failed to generate reasoning: {str(e)}"}
 
 # ────────────────────────────────────────────────
 # Chart Endpoint
 # ────────────────────────────────────────────────
 @app.get("/chart")
-def chart(interval: str = Query("5m")):
+async def chart(interval: str = "5m"):
     try:
-        valid_intervals = ["1m", "5m", "15m"]
-        if interval not in valid_intervals:
-            interval = "5m"
-
-        # No custom session here either!
-        data = yf.download("^NSEI", period="5d", interval=interval, progress=False)
+        loop = asyncio.get_event_loop()
+        # Also run chart download in thread to prevent crashes
+        data = await loop.run_in_executor(None, lambda: yf.download("^NSEI", period="5d", interval=interval, progress=False))
         
         if data.empty:
             return {"error": "No chart data available from Yahoo"}
@@ -209,7 +222,6 @@ def chart(interval: str = Query("5m")):
         ema_fast = close.ewm(span=9, adjust=False).mean()
         ema_slow = close.ewm(span=21, adjust=False).mean()
 
-        # Supertrend
         tr1 = high - low
         tr2 = abs(high - close.shift())
         tr3 = abs(low - close.shift())
@@ -345,9 +357,9 @@ async function loadData() {
         else if (pred.signal === "SELL") signalEl.style.color = "red";
         else signalEl.style.color = "#aaa";
 
-        // If data error, show message and stop
-        if (pred.signal === "DATA ERROR" || pred.signal === "ERROR") {
-             errorEl.innerText = pred.message;
+        // Show critical errors clearly
+        if (pred.signal === "DATA ERROR" || pred.signal === "ERROR" || pred.signal === "CRITICAL ERROR") {
+             errorEl.innerText = pred.message + (pred.trace ? "\\n" + pred.trace : "");
              return;
         }
 
