@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+herefrom fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, HTMLResponse
 import pandas as pd
 import traceback
@@ -15,6 +15,10 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 @app.get("/")
 async def get_dashboard_data(interval: str = "5m"):
+    # VALIDATE INTERVAL
+    if interval not in ["1m", "5m", "15m", "30m", "1h"]:
+        interval = "5m"
+        
     result, error = await get_market_data(interval)
     if error:
         return {"signal": "DATA ERROR", "message": error}
@@ -37,6 +41,7 @@ async def get_dashboard_data(interval: str = "5m"):
     rsi_last = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
     st_last = float(supertrend.iloc[-1])
     st_dir_val = direction.iloc[-1]
+    atr_last = float(atr.iloc[-1]) if pd.notna(atr.iloc[-1]) else 0.0
     
     # Generate Signal
     ema_bullish = fast > slow
@@ -51,8 +56,25 @@ async def get_dashboard_data(interval: str = "5m"):
     else:
         signal = "NEUTRAL"
         
+    # --- TARGET / STOP LOSS LOGIC (Restored) ---
+    risk_atr = atr_last * 1.5   # Risk 1.5x ATR
+    reward_atr = atr_last * 3.0 # Reward 3.0x ATR (1:2 Ratio)
+    
+    target = 0
+    stop_loss = 0
+    
+    if signal == "BUY":
+        target = price + reward_atr
+        stop_loss = price - risk_atr
+    elif signal == "SELL":
+        target = price - reward_atr
+        stop_loss = price + risk_atr
+    else:
+        # If neutral, show levels based on current price just for reference
+        target = price + reward_atr
+        stop_loss = price - risk_atr
+
     # --- CHART DATA PACKAGING ---
-    # We take the last 300 candles for the chart
     chart_data = data.tail(300)
     candles = []
     volume_data = []
@@ -68,7 +90,7 @@ async def get_dashboard_data(interval: str = "5m"):
         if None not in [o, h, l, c]:
             candles.append({"time": time_unix, "open": o, "high": h, "low": l, "close": c})
             
-            # Volume (Color based on close > open)
+            # Volume
             vol_color = "rgba(0, 150, 136, 0.5)" if c >= o else "rgba(255, 82, 82, 0.5)"
             v = clean_val(float(row["Volume"]))
             if v:
@@ -91,6 +113,8 @@ async def get_dashboard_data(interval: str = "5m"):
         "st_dir": "BULLISH" if st_dir_val == 1 else "BEARISH",
         "market_status": status,
         "last_updated": result["last_updated"],
+        "target": clean_val(round(target, 2)),
+        "stop_loss": clean_val(round(stop_loss, 2)),
         "candles": candles,
         "volume": volume_data,
         "ema_fast": ema_fast_data,
@@ -134,8 +158,14 @@ header { background: var(--panel); padding: 12px 20px; display: flex; justify-co
 /* METRICS GRID */
 .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 20px; }
 .metric-box { background: #151920; padding: 12px; border-radius: 8px; text-align: center; border: 1px solid #2a2a2a; }
-.metric-label { font-size: 12px; color: #888; text-transform: uppercase; }
-.metric-value { font-size: 16px; font-weight: bold; color: var(--accent); margin-top: 4px; }
+.metric-label { font-size: 11px; color: #888; text-transform: uppercase; }
+.metric-value { font-size: 15px; font-weight: bold; color: var(--accent); margin-top: 4px; }
+
+/* RISK REWARD BOX */
+.rr-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }
+.rr-box { background: #151920; padding: 10px; border-radius: 6px; text-align: center; border: 1px solid #333; }
+.rr-label { color: #aaa; font-size: 12px; }
+.rr-val { font-size: 18px; font-weight: bold; color: white; }
 
 /* CHART CONTAINER */
 #chart-container { position: relative; height: 500px; width: 100%; border-radius: 12px; overflow: hidden; border: 1px solid #333; }
@@ -145,7 +175,8 @@ header { background: var(--panel); padding: 12px 20px; display: flex; justify-co
 }
 
 /* FOOTER */
-.timer-bar { display: flex; justify-content: space-between; font-size: 12px; color: #666; margin-top: 5px; padding: 0 10px; }
+.timer-bar { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #666; margin-top: 5px; padding: 0 10px; }
+select { background: #333; color: white; border: none; padding: 5px; border-radius: 4px; }
 </style>
 </head>
 <body>
@@ -163,6 +194,17 @@ header { background: var(--panel); padding: 12px 20px; display: flex; justify-co
         <button class="refresh-btn" onclick="loadData(true)">↻ Refresh</button>
         <div id="signal-text">LOADING</div>
         <div class="price-display" id="price-text">---</div>
+    </div>
+
+    <div class="rr-grid">
+        <div class="rr-box" style="border-color: #26a69a;">
+            <div class="rr-label">TARGET</div>
+            <div class="rr-val" id="target-val" style="color: #26a69a;">--</div>
+        </div>
+        <div class="rr-box" style="border-color: #ef5350;">
+            <div class="rr-label">STOP LOSS</div>
+            <div class="rr-val" id="sl-val" style="color: #ef5350;">--</div>
+        </div>
     </div>
 
     <div class="metrics">
@@ -185,7 +227,16 @@ header { background: var(--panel); padding: 12px 20px; display: flex; justify-co
     </div>
     
     <div class="timer-bar">
-        <span>Interval: 5 Min</span>
+        <div>
+            Interval: 
+            <select id="interval-select" onchange="changeInterval()">
+                <option value="1m">1 Min</option>
+                <option value="5m" selected>5 Min</option>
+                <option value="15m">15 Min</option>
+                <option value="30m">30 Min</option>
+                <option value="1h">1 Hour</option>
+            </select>
+        </div>
         <span id="next-candle-timer">Next Candle: --:--</span>
     </div>
 </div>
@@ -196,21 +247,8 @@ const chartContainer = document.getElementById('chart-container');
 const chart = LightweightCharts.createChart(chartContainer, {
     layout: { background: { color: '#0b0c10' }, textColor: '#d1d4dc' },
     grid: { vertLines: { color: '#1f2833' }, horzLines: { color: '#1f2833' } },
-    
-    // FIX 1: Real-time Up/Down Movement
-    rightPriceScale: { 
-        borderColor: 'rgba(197, 198, 199, 0.2)',
-        autoScale: true, // This allows the chart to move up/down dynamically
-        scaleMargins: { top: 0.1, bottom: 0.2 } // Gives space for volume at bottom
-    },
-    
-    timeScale: { 
-        borderColor: 'rgba(197, 198, 199, 0.2)', 
-        timeVisible: true,
-        // FIX 2: Prevent "Lost" Chart
-        minBarSpacing: 5, // Prevents zooming out too far into nothingness
-        rightOffset: 5,   // Adds breathing room on the right side
-    },
+    rightPriceScale: { borderColor: 'rgba(197, 198, 199, 0.2)', autoScale: true },
+    timeScale: { borderColor: 'rgba(197, 198, 199, 0.2)', timeVisible: true, minBarSpacing: 5, rightOffset: 5 },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
 });
 
@@ -220,19 +258,27 @@ const supertrendSeries = chart.addLineSeries({ color: '#ae22e0', lineWidth: 2, t
 const emaFastSeries = chart.addLineSeries({ color: '#fdd835', lineWidth: 1, title: 'EMA 9' });
 const emaSlowSeries = chart.addLineSeries({ color: '#ff9800', lineWidth: 1, title: 'EMA 21' });
 
-// FIX 3: Flag to stop resetting zoom
 let isFirstLoad = true;
+
+// FIX: Handle Interval Change
+function changeInterval() {
+    isFirstLoad = true; // Reset zoom on interval change
+    loadData(true);
+}
 
 async function loadData(manual = false) {
     if(manual) document.querySelector('.refresh-btn').innerText = "Loading...";
     
+    // FIX: Get value from dropdown
+    const interval = document.getElementById("interval-select").value;
+    
     try {
-        const res = await fetch("/?interval=5m");
+        const res = await fetch(`/?interval=${interval}`);
         const d = await res.json();
         
         if(d.signal === "DATA ERROR") { alert(d.message); return; }
 
-        // 1. UPDATE HEADER & METRICS
+        // 1. UPDATE METRICS
         const statusEl = document.getElementById("market-status");
         statusEl.className = d.market_status === "OPEN" ? "status-dot status-open" : "status-dot status-closed";
         document.getElementById("last-updated").innerText = "Updated: " + d.last_updated;
@@ -244,10 +290,12 @@ async function loadData(manual = false) {
         document.getElementById("price-text").innerText = "₹" + d.price;
         document.getElementById("rsi-val").innerText = d.rsi;
         document.getElementById("st-val").innerText = d.supertrend;
-        
-        const trendEl = document.getElementById("trend-val");
-        trendEl.innerText = d.st_dir;
-        trendEl.style.color = d.st_dir === "BULLISH" ? "#26a69a" : "#ef5350";
+        document.getElementById("trend-val").innerText = d.st_dir;
+        document.getElementById("trend-val").style.color = d.st_dir === "BULLISH" ? "#26a69a" : "#ef5350";
+
+        // RESTORED TARGETS
+        document.getElementById("target-val").innerText = d.target || "--";
+        document.getElementById("sl-val").innerText = d.stop_loss || "--";
 
         // 2. UPDATE CHART
         if(d.candles.length > 0) {
@@ -257,8 +305,6 @@ async function loadData(manual = false) {
             emaSlowSeries.setData(d.ema_slow);
             supertrendSeries.setData(d.supertrend_line);
             
-            // CRITICAL FIX: Only fit content ONCE. 
-            // After the first load, we leave the zoom level alone.
             if(isFirstLoad) {
                 chart.timeScale().fitContent();
                 isFirstLoad = false;
@@ -279,11 +325,9 @@ chart.subscribeCrosshairMove(param => {
         toolTip.style.display = 'none';
         return;
     }
-    
     const candle = param.seriesData.get(candleSeries);
     const st = param.seriesData.get(supertrendSeries);
     const vol = param.seriesData.get(volumeSeries);
-    
     if(candle) {
         toolTip.style.display = 'block';
         toolTip.innerHTML = `
@@ -295,18 +339,6 @@ chart.subscribeCrosshairMove(param => {
         `;
     }
 });
-
-// --- COUNTDOWN TIMER ---
-setInterval(() => {
-    const now = new Date();
-    const minutes = now.getMinutes();
-    const nextFive = Math.ceil((minutes + 1) / 5) * 5;
-    const diffMin = nextFive - minutes - 1;
-    const diffSec = 59 - now.getSeconds();
-    
-    document.getElementById("next-candle-timer").innerText = 
-        `Candle Close: ${diffMin}:${diffSec < 10 ? '0'+diffSec : diffSec}`;
-}, 1000);
 
 // RESIZE HANDLER
 window.addEventListener('resize', () => {
